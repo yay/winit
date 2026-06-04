@@ -5,7 +5,7 @@ use std::ptr;
 
 use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
     NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
@@ -24,7 +24,7 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::{LogicalPosition, LogicalSize};
+use crate::dpi::LogicalPosition;
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
     WindowEvent,
@@ -165,6 +165,11 @@ declare_class!(
         #[method(viewDidMoveToWindow)]
         fn view_did_move_to_window(&self) {
             trace_scope!("viewDidMoveToWindow");
+            unsafe {
+                // 2 == NSViewLayerContentsRedrawDuringViewResize. Ask AppKit to redisplay the
+                // layer while the view is being resized so layer-backed surfaces keep painting.
+                let _: () = msg_send![self, setLayerContentsRedrawPolicy: 2isize];
+            }
             if let Some(tracking_rect) = self.ivars().tracking_rect.take() {
                 self.removeTrackingRect(tracking_rect);
             }
@@ -175,6 +180,15 @@ declare_class!(
             };
             assert_ne!(tracking_rect, 0, "failed adding tracking rect");
             self.ivars().tracking_rect.set(Some(tracking_rect));
+        }
+
+        #[method(viewDidChangeBackingProperties)]
+        fn view_did_change_backing_properties(&self) {
+            trace_scope!("viewDidChangeBackingProperties");
+            // Moving between displays or changing scale can alter the drawable backing size
+            // without a matching frame-size change.
+            self.surface_resized();
+            self.redraw_during_live_resize();
         }
 
         #[method(frameDidChange:)]
@@ -194,9 +208,11 @@ declare_class!(
             // Emit resize event here rather than from windowDidResize because:
             // 1. When a new window is created as a tab, the frame size may change without a window resize occurring.
             // 2. Even when a window resize does occur on a new tabbed window, it contains the wrong size (includes tab height).
-            let logical_size = LogicalSize::new(rect.size.width as f64, rect.size.height as f64);
-            let size = logical_size.to_physical::<u32>(self.scale_factor());
-            self.queue_event(WindowEvent::Resized(size));
+            self.surface_resized();
+            // During live resize, AppKit may not let the normal event loop reach its next redraw
+            // point before stretching the current layer contents. Redraw immediately after the
+            // app has observed the new surface size.
+            self.redraw_during_live_resize();
         }
 
         #[method(drawRect:)]
@@ -837,6 +853,22 @@ impl WinitView {
 
     fn queue_event(&self, event: WindowEvent) {
         self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
+    }
+
+    fn surface_resized(&self) {
+        // During live resize the view's backing bounds are the authoritative drawable size.
+        // Deriving this from the window frame can be stale, especially when the origin moves.
+        let bounds = self.bounds();
+        let backing_bounds = unsafe { self.convertRectToBacking(bounds) };
+        let width = backing_bounds.size.width.round().max(0.0) as u32;
+        let height = backing_bounds.size.height.round().max(0.0) as u32;
+        self.queue_event(WindowEvent::Resized((width, height).into()));
+    }
+
+    fn redraw_during_live_resize(&self) {
+        if unsafe { self.window().inLiveResize() } {
+            self.ivars().app_delegate.handle_redraw(self.window().id());
+        }
     }
 
     fn scale_factor(&self) -> f64 {
