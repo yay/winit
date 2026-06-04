@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use dpi::{LogicalPosition, LogicalSize};
+use dpi::{LogicalPosition, PhysicalSize};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send};
@@ -161,10 +161,20 @@ define_class!(
             //    resize occurring.
             // 2. Even when a window resize does occur on a new tabbed window, it contains the wrong
             //    size (includes tab height).
-            let rect = self.frame();
-            let logical_size = LogicalSize::new(rect.size.width as f64, rect.size.height as f64);
-            let size = logical_size.to_physical::<u32>(self.scale_factor());
-            self.queue_event(WindowEvent::SurfaceResized(size));
+            self.surface_resized();
+            // During live resize, AppKit may not let the normal event loop reach its next redraw
+            // point before stretching the current layer contents. Redraw immediately after the
+            // app has observed the new surface size.
+            self.redraw_during_live_resize();
+        }
+
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            let _entered = debug_span!("viewDidChangeBackingProperties").entered();
+            // Moving between displays or changing scale can alter the drawable backing size
+            // without a matching frame-size change.
+            self.surface_resized();
+            self.redraw_during_live_resize();
         }
 
         #[unsafe(method(drawRect:))]
@@ -852,6 +862,37 @@ impl WinitView {
         self.ivars().app_state.maybe_queue_with_handler(move |app, event_loop| {
             app.window_event(event_loop, window_id, event);
         });
+    }
+
+    fn surface_resized(&self) {
+        let Some(window) = (**self).window() else {
+            return;
+        };
+        let size = self.surface_size();
+        let window_id = window_id(&window);
+        self.ivars().app_state.maybe_queue_with_handler(move |app, event_loop| {
+            app.window_event(event_loop, window_id, WindowEvent::SurfaceResized(size));
+        });
+    }
+
+    /// Returns the drawable size from the view's backing-coordinate bounds.
+    pub(super) fn surface_size(&self) -> PhysicalSize<u32> {
+        // The view bounds are authoritative for full-size content views and during live resize.
+        // Deriving this from the window frame can exclude custom titlebar content or be stale.
+        let backing_bounds = self.convertRectToBacking(self.bounds());
+        PhysicalSize::new(
+            backing_bounds.size.width.round().max(0.0) as u32,
+            backing_bounds.size.height.round().max(0.0) as u32,
+        )
+    }
+
+    fn redraw_during_live_resize(&self) {
+        let Some(window) = (**self).window() else {
+            return;
+        };
+        if window.inLiveResize() {
+            self.ivars().app_state.handle_redraw(window_id(&window));
+        }
     }
 
     fn scale_factor(&self) -> f64 {
