@@ -1254,6 +1254,16 @@ impl WindowDelegate {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
+        // `NSWindow::zoom` runs AppKit's live-resize animation synchronously. If we start it
+        // while handling a winit event, AppKit's resize/display callbacks cannot be delivered
+        // immediately and the window server animates stale layer contents instead.
+        if self.ivars().app_delegate.is_handling_event() {
+            let mtm = MainThreadMarker::from(self);
+            let this = self.retain();
+            RunLoop::main(mtm).queue_closure(move || this.set_maximized(maximized));
+            return;
+        }
+
         let mtm = MainThreadMarker::from(self);
         let is_zoomed = self.is_zoomed();
         if is_zoomed == maximized {

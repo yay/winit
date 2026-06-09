@@ -258,6 +258,10 @@ impl ApplicationDelegate {
         self.ivars().control_flow.set(value)
     }
 
+    pub(super) fn is_handling_event(&self) -> bool {
+        self.ivars().event_handler.in_use()
+    }
+
     pub fn control_flow(&self) -> ControlFlow {
         self.ivars().control_flow.get()
     }
