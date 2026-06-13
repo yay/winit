@@ -24,7 +24,7 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::LogicalPosition;
+use crate::dpi::{LogicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
     WindowEvent,
@@ -856,13 +856,18 @@ impl WinitView {
     }
 
     fn surface_resized(&self) {
-        // During live resize the view's backing bounds are the authoritative drawable size.
-        // Deriving this from the window frame can be stale, especially when the origin moves.
-        let bounds = self.bounds();
-        let backing_bounds = unsafe { self.convertRectToBacking(bounds) };
-        let width = backing_bounds.size.width.round().max(0.0) as u32;
-        let height = backing_bounds.size.height.round().max(0.0) as u32;
-        self.queue_event(WindowEvent::Resized((width, height).into()));
+        self.queue_event(WindowEvent::Resized(self.surface_size()));
+    }
+
+    /// Returns the drawable size from the view's backing-coordinate bounds.
+    pub(super) fn surface_size(&self) -> PhysicalSize<u32> {
+        // The view bounds are authoritative for full-size content views and during live resize.
+        // Deriving this from the window frame can exclude custom titlebar content or be stale.
+        let backing_bounds = unsafe { self.convertRectToBacking(self.bounds()) };
+        PhysicalSize::new(
+            backing_bounds.size.width.round().max(0.0) as u32,
+            backing_bounds.size.height.round().max(0.0) as u32,
+        )
     }
 
     fn redraw_during_live_resize(&self) {
