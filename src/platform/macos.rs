@@ -93,6 +93,12 @@ use crate::window::{Window, WindowAttributes};
 
 /// Additional methods on [`Window`] that are specific to MacOS.
 pub trait WindowExtMacOS {
+    /// Returns whether AppKit is currently live-resizing the window.
+    ///
+    /// This is `true` only while the user is interactively resizing the window or AppKit is
+    /// running an equivalent native resize transition.
+    fn is_live_resizing(&self) -> bool;
+
     /// Returns whether or not the window is in simple fullscreen mode.
     fn simple_fullscreen(&self) -> bool;
 
@@ -173,6 +179,11 @@ pub trait WindowExtMacOS {
 }
 
 impl WindowExtMacOS for Window {
+    #[inline]
+    fn is_live_resizing(&self) -> bool {
+        self.window.maybe_wait_on_main(|w| w.is_live_resizing())
+    }
+
     #[inline]
     fn simple_fullscreen(&self) -> bool {
         self.window.maybe_wait_on_main(|w| w.simple_fullscreen())
