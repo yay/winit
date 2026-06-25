@@ -920,6 +920,20 @@ impl WindowDelegate {
         unsafe { self.window().inLiveResize() }
     }
 
+    fn defer_if_handling_event(&self, f: impl FnOnce(Retained<Self>) + 'static) -> bool {
+        // AppKit state transitions such as zoom/fullscreen can synchronously run resize/display
+        // callbacks. Starting them from inside a winit event callback prevents those callbacks
+        // from being delivered immediately, so defer the transition to the next run-loop turn.
+        if !self.ivars().app_delegate.is_handling_event() {
+            return false;
+        }
+
+        let mtm = MainThreadMarker::from(self);
+        let this = self.retain();
+        RunLoop::main(mtm).queue_closure(move || f(this));
+        true
+    }
+
     #[inline]
     pub fn pre_present_notify(&self) {}
 
@@ -1255,13 +1269,7 @@ impl WindowDelegate {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
-        // `NSWindow::zoom` runs AppKit's live-resize animation synchronously. If we start it
-        // while handling a winit event, AppKit's resize/display callbacks cannot be delivered
-        // immediately and the window server animates stale layer contents instead.
-        if self.ivars().app_delegate.is_handling_event() {
-            let mtm = MainThreadMarker::from(self);
-            let this = self.retain();
-            RunLoop::main(mtm).queue_closure(move || this.set_maximized(maximized));
+        if self.defer_if_handling_event(move |this| this.set_maximized(maximized)) {
             return;
         }
 
@@ -1310,9 +1318,6 @@ impl WindowDelegate {
 
     #[inline]
     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
-        let mtm = MainThreadMarker::from(self);
-        let app = NSApplication::sharedApplication(mtm);
-
         if self.ivars().is_simple_fullscreen.get() {
             return;
         }
@@ -1326,6 +1331,18 @@ impl WindowDelegate {
         if fullscreen == old_fullscreen {
             return;
         }
+
+        if !self.ivars().initial_fullscreen.get()
+            && self.defer_if_handling_event({
+                let fullscreen = fullscreen.clone();
+                move |this| this.set_fullscreen(fullscreen)
+            })
+        {
+            return;
+        }
+
+        let mtm = MainThreadMarker::from(self);
+        let app = NSApplication::sharedApplication(mtm);
 
         // If the fullscreen is on a different monitor, we must move the window
         // to that monitor before we toggle fullscreen (as `toggleFullScreen`
