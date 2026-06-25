@@ -163,6 +163,7 @@ declare_class!(
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidResize:");
+            self.refresh_maximized();
             // NOTE: WindowEvent::Resized is reported in frameDidChange.
             self.emit_move_event();
         }
@@ -178,6 +179,7 @@ declare_class!(
         #[method(windowDidEndLiveResize:)]
         fn window_did_end_live_resize(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidEndLiveResize:");
+            self.refresh_maximized();
             self.set_resize_increments_inner(NSSize::new(1., 1.));
             self.request_redraw();
         }
@@ -232,6 +234,7 @@ declare_class!(
         #[method(windowWillEnterFullScreen:)]
         fn window_will_enter_fullscreen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowWillEnterFullScreen:");
+            self.log_fullscreen_diagnostic("windowWillEnterFullScreen");
 
             self.ivars().maximized.set(self.is_zoomed());
             let mut fullscreen = self.ivars().fullscreen.borrow_mut();
@@ -258,6 +261,7 @@ declare_class!(
         #[method(windowWillExitFullScreen:)]
         fn window_will_exit_fullscreen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowWillExitFullScreen:");
+            self.log_fullscreen_diagnostic("windowWillExitFullScreen");
 
             self.ivars().in_fullscreen_transition.set(true);
         }
@@ -292,23 +296,31 @@ declare_class!(
         #[method(windowDidEnterFullScreen:)]
         fn window_did_enter_fullscreen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidEnterFullScreen:");
+            self.log_fullscreen_diagnostic("windowDidEnterFullScreen before target");
             self.ivars().initial_fullscreen.set(false);
             self.ivars().in_fullscreen_transition.set(false);
+            self.request_redraw();
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
+                warn!(?target_fullscreen, "steady fullscreen diagnostic: applying target after enter");
                 self.set_fullscreen(target_fullscreen);
             }
+            self.log_fullscreen_diagnostic("windowDidEnterFullScreen after target");
         }
 
         /// Invoked when exited fullscreen
         #[method(windowDidExitFullScreen:)]
         fn window_did_exit_fullscreen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidExitFullScreen:");
+            self.log_fullscreen_diagnostic("windowDidExitFullScreen before restore");
 
             self.restore_state_from_fullscreen();
             self.ivars().in_fullscreen_transition.set(false);
+            self.request_redraw();
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
+                warn!(?target_fullscreen, "steady fullscreen diagnostic: applying target after exit");
                 self.set_fullscreen(target_fullscreen);
             }
+            self.log_fullscreen_diagnostic("windowDidExitFullScreen after target");
         }
 
         /// Invoked when fail to enter fullscreen
@@ -330,6 +342,7 @@ declare_class!(
         #[method(windowDidFailToEnterFullScreen:)]
         fn window_did_fail_to_enter_fullscreen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidFailToEnterFullScreen:");
+            self.log_fullscreen_diagnostic("windowDidFailToEnterFullScreen before restore");
             self.ivars().in_fullscreen_transition.set(false);
             self.ivars().target_fullscreen.replace(None);
             if self.ivars().initial_fullscreen.get() {
@@ -343,6 +356,7 @@ declare_class!(
             } else {
                 self.restore_state_from_fullscreen();
             }
+            self.log_fullscreen_diagnostic("windowDidFailToEnterFullScreen after restore");
         }
 
         // Invoked when the occlusion state of the window changes
@@ -827,10 +841,13 @@ impl WindowDelegate {
 
         let suggested_size = self.view().surface_size();
         let new_inner_size = Arc::new(Mutex::new(suggested_size));
-        app_delegate.handle_window_event(window.id(), WindowEvent::ScaleFactorChanged {
-            scale_factor,
-            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
-        });
+        app_delegate.handle_window_event(
+            window.id(),
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
+            },
+        );
         let physical_size = *new_inner_size.lock().unwrap();
         drop(new_inner_size);
 
@@ -915,9 +932,43 @@ impl WindowDelegate {
         self.ivars().app_delegate.queue_redraw(self.window().id());
     }
 
+    fn refresh_maximized(&self) {
+        self.ivars().maximized.set(self.is_zoomed());
+    }
+
     /// Returns AppKit's authoritative native live-resize state.
     pub fn is_live_resizing(&self) -> bool {
         unsafe { self.window().inLiveResize() }
+    }
+
+    pub fn is_fullscreen_transition(&self) -> bool {
+        self.ivars().in_fullscreen_transition.get()
+    }
+
+    fn log_fullscreen_diagnostic(&self, phase: &'static str) {
+        let window = self.window();
+        let frame = window.frame();
+        warn!(
+            phase,
+            window_id = ?window.id(),
+            ns_window_number = unsafe { window.windowNumber() },
+            style_mask = ?window.styleMask(),
+            fullscreen = ?*self.ivars().fullscreen.borrow(),
+            target_fullscreen = ?*self.ivars().target_fullscreen.borrow(),
+            in_fullscreen_transition = self.ivars().in_fullscreen_transition.get(),
+            initial_fullscreen = self.ivars().initial_fullscreen.get(),
+            saved_style = ?self.ivars().saved_style.get(),
+            maximized = self.ivars().maximized.get(),
+            is_zoomed = window.isZoomed(),
+            is_visible = window.isVisible(),
+            is_key = window.isKeyWindow(),
+            is_live_resizing = unsafe { window.inLiveResize() },
+            frame_x = frame.origin.x,
+            frame_y = frame.origin.y,
+            frame_w = frame.size.width,
+            frame_h = frame.size.height,
+            "steady fullscreen diagnostic"
+        );
     }
 
     fn defer_if_handling_event(&self, f: impl FnOnce(Retained<Self>) + 'static) -> bool {
@@ -1187,6 +1238,7 @@ impl WindowDelegate {
         let event =
             NSApplication::sharedApplication(mtm).currentEvent().ok_or(ExternalError::Ignored)?;
         self.window().performWindowDragWithEvent(&event);
+        self.refresh_maximized();
         Ok(())
     }
 
@@ -1276,6 +1328,7 @@ impl WindowDelegate {
         let mtm = MainThreadMarker::from(self);
         let is_zoomed = self.is_zoomed();
         if is_zoomed == maximized {
+            self.ivars().maximized.set(maximized);
             return;
         };
 
@@ -1313,22 +1366,33 @@ impl WindowDelegate {
 
     #[inline]
     pub fn is_maximized(&self) -> bool {
-        self.is_zoomed()
+        self.ivars().maximized.get()
     }
 
     #[inline]
     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
+        self.log_fullscreen_diagnostic("set_fullscreen start");
+        warn!(?fullscreen, "steady fullscreen diagnostic: set_fullscreen requested");
         if self.ivars().is_simple_fullscreen.get() {
+            warn!("steady fullscreen diagnostic: set_fullscreen ignored because simple fullscreen is active");
             return;
         }
         if self.ivars().in_fullscreen_transition.get() {
             // We can't set fullscreen here.
             // Set fullscreen after transition.
+            warn!(
+                ?fullscreen,
+                "steady fullscreen diagnostic: deferring set_fullscreen until transition ends"
+            );
             self.ivars().target_fullscreen.replace(Some(fullscreen));
             return;
         }
         let old_fullscreen = self.ivars().fullscreen.borrow().clone();
         if fullscreen == old_fullscreen {
+            warn!(
+                ?fullscreen,
+                "steady fullscreen diagnostic: set_fullscreen no-op, state already matches"
+            );
             return;
         }
 
@@ -1338,6 +1402,10 @@ impl WindowDelegate {
                 move |this| this.set_fullscreen(fullscreen)
             })
         {
+            warn!(
+                ?fullscreen,
+                "steady fullscreen diagnostic: set_fullscreen queued to next run-loop turn"
+            );
             return;
         }
 
@@ -1437,6 +1505,11 @@ impl WindowDelegate {
         }
 
         self.ivars().fullscreen.replace(fullscreen.clone());
+        warn!(
+            ?old_fullscreen,
+            ?fullscreen,
+            "steady fullscreen diagnostic: set_fullscreen applying transition"
+        );
 
         fn toggle_fullscreen(window: &WinitWindow) {
             // Window level must be restored from `CGShieldingWindowLevel()
@@ -1756,6 +1829,11 @@ impl WindowExtMacOS for WindowDelegate {
     #[inline]
     fn is_live_resizing(&self) -> bool {
         WindowDelegate::is_live_resizing(self)
+    }
+
+    #[inline]
+    fn is_fullscreen_transition(&self) -> bool {
+        WindowDelegate::is_fullscreen_transition(self)
     }
 
     #[inline]
