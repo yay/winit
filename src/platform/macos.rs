@@ -99,6 +99,9 @@ pub trait WindowExtMacOS {
     /// running an equivalent native resize transition.
     fn is_live_resizing(&self) -> bool;
 
+    /// Returns whether AppKit is currently entering or exiting native fullscreen.
+    fn is_fullscreen_transition(&self) -> bool;
+
     /// Returns whether or not the window is in simple fullscreen mode.
     fn simple_fullscreen(&self) -> bool;
 
@@ -182,6 +185,11 @@ impl WindowExtMacOS for Window {
     #[inline]
     fn is_live_resizing(&self) -> bool {
         self.window.maybe_wait_on_main(|w| w.is_live_resizing())
+    }
+
+    #[inline]
+    fn is_fullscreen_transition(&self) -> bool {
+        self.window.maybe_wait_on_main(|w| w.is_fullscreen_transition())
     }
 
     #[inline]
