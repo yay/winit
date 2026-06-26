@@ -163,6 +163,7 @@ declare_class!(
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidResize:");
+            self.refresh_maximized();
             // NOTE: WindowEvent::Resized is reported in frameDidChange.
             self.emit_move_event();
         }
@@ -178,6 +179,7 @@ declare_class!(
         #[method(windowDidEndLiveResize:)]
         fn window_did_end_live_resize(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidEndLiveResize:");
+            self.refresh_maximized();
             self.set_resize_increments_inner(NSSize::new(1., 1.));
             self.request_redraw();
         }
@@ -294,6 +296,7 @@ declare_class!(
             trace_scope!("windowDidEnterFullScreen:");
             self.ivars().initial_fullscreen.set(false);
             self.ivars().in_fullscreen_transition.set(false);
+            self.request_redraw();
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
                 self.set_fullscreen(target_fullscreen);
             }
@@ -306,6 +309,7 @@ declare_class!(
 
             self.restore_state_from_fullscreen();
             self.ivars().in_fullscreen_transition.set(false);
+            self.request_redraw();
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
                 self.set_fullscreen(target_fullscreen);
             }
@@ -827,10 +831,13 @@ impl WindowDelegate {
 
         let suggested_size = self.view().surface_size();
         let new_inner_size = Arc::new(Mutex::new(suggested_size));
-        app_delegate.handle_window_event(window.id(), WindowEvent::ScaleFactorChanged {
-            scale_factor,
-            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
-        });
+        app_delegate.handle_window_event(
+            window.id(),
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
+            },
+        );
         let physical_size = *new_inner_size.lock().unwrap();
         drop(new_inner_size);
 
@@ -915,9 +922,17 @@ impl WindowDelegate {
         self.ivars().app_delegate.queue_redraw(self.window().id());
     }
 
+    fn refresh_maximized(&self) {
+        self.ivars().maximized.set(self.is_zoomed());
+    }
+
     /// Returns AppKit's authoritative native live-resize state.
     pub fn is_live_resizing(&self) -> bool {
         unsafe { self.window().inLiveResize() }
+    }
+
+    pub fn is_fullscreen_transition(&self) -> bool {
+        self.ivars().in_fullscreen_transition.get()
     }
 
     fn defer_if_handling_event(&self, f: impl FnOnce(Retained<Self>) + 'static) -> bool {
@@ -1187,6 +1202,7 @@ impl WindowDelegate {
         let event =
             NSApplication::sharedApplication(mtm).currentEvent().ok_or(ExternalError::Ignored)?;
         self.window().performWindowDragWithEvent(&event);
+        self.refresh_maximized();
         Ok(())
     }
 
@@ -1276,6 +1292,7 @@ impl WindowDelegate {
         let mtm = MainThreadMarker::from(self);
         let is_zoomed = self.is_zoomed();
         if is_zoomed == maximized {
+            self.ivars().maximized.set(maximized);
             return;
         };
 
@@ -1313,7 +1330,7 @@ impl WindowDelegate {
 
     #[inline]
     pub fn is_maximized(&self) -> bool {
-        self.is_zoomed()
+        self.ivars().maximized.get()
     }
 
     #[inline]
@@ -1756,6 +1773,11 @@ impl WindowExtMacOS for WindowDelegate {
     #[inline]
     fn is_live_resizing(&self) -> bool {
         WindowDelegate::is_live_resizing(self)
+    }
+
+    #[inline]
+    fn is_fullscreen_transition(&self) -> bool {
+        WindowDelegate::is_fullscreen_transition(self)
     }
 
     #[inline]
