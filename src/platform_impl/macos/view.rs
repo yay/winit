@@ -856,7 +856,13 @@ impl WinitView {
     }
 
     fn surface_resized(&self) {
-        self.queue_event(WindowEvent::Resized(self.surface_size()));
+        let size = self.surface_size();
+        let view = self.retain();
+        self.ivars().app_delegate.maybe_queue_window_resize(
+            self.window().id(),
+            size,
+            move || view.surface_size(),
+        );
     }
 
     /// Returns the drawable size from the view's backing-coordinate bounds.

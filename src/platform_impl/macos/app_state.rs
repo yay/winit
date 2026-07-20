@@ -14,6 +14,7 @@ use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
 use super::{menu, WindowId, DEVICE_ID};
+use crate::dpi::PhysicalSize;
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::window::WindowId as RootWindowId;
@@ -268,6 +269,29 @@ impl ApplicationDelegate {
 
     pub fn maybe_queue_window_event(&self, window_id: WindowId, event: WindowEvent) {
         self.maybe_queue_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
+    }
+
+    /// Delivers a surface resize immediately, or re-samples it if delivery must be deferred.
+    ///
+    /// AppKit can continue changing a view's frame while a resize event is waiting for the default
+    /// run-loop mode. Re-reading the backing size at delivery prevents an older queued size from
+    /// overwriting newer resize events emitted during that transition.
+    pub fn maybe_queue_window_resize(
+        &self,
+        window_id: WindowId,
+        size: PhysicalSize<u32>,
+        current_size: impl FnOnce() -> PhysicalSize<u32> + 'static,
+    ) {
+        if !self.ivars().event_handler.in_use() {
+            self.handle_window_event(window_id, WindowEvent::Resized(size));
+        } else {
+            let event = WindowEvent::Resized(size);
+            tracing::debug!(?event, "had to queue event since another is currently being handled");
+            let this = self.retain();
+            self.ivars().run_loop.queue_closure(move || {
+                this.handle_window_event(window_id, WindowEvent::Resized(current_size()));
+            });
+        }
     }
 
     pub fn handle_window_event(&self, window_id: WindowId, event: WindowEvent) {
