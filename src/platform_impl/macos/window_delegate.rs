@@ -32,7 +32,7 @@ use super::monitor::{self, flip_window_screen_coordinates, get_display_id};
 use super::observer::RunLoop;
 use super::view::WinitView;
 use super::window::WinitWindow;
-use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
+use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId, DEVICE_ID};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
@@ -172,6 +172,12 @@ declare_class!(
         fn window_will_start_live_resize(&self, _: Option<&AnyObject>) {
             trace_scope!("windowWillStartLiveResize:");
 
+            // AppKit owns the pointer during native edge/corner resizing and may not deliver
+            // mouseExited: or mouseMoved: to the content view. Clear the last client position
+            // before resize redraws can hit-test new content beneath that stale position.
+            self.queue_event(WindowEvent::CursorLeft { device_id: DEVICE_ID });
+            self.request_redraw();
+
             let increments = self.ivars().resize_increments.get();
             self.set_resize_increments_inner(increments);
         }
@@ -181,6 +187,7 @@ declare_class!(
             trace_scope!("windowDidEndLiveResize:");
             self.refresh_maximized();
             self.set_resize_increments_inner(NSSize::new(1., 1.));
+            self.view().restore_cursor_after_live_resize();
             self.request_redraw();
         }
 

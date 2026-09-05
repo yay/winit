@@ -661,6 +661,9 @@ declare_class!(
         #[method(mouseEntered:)]
         fn mouse_entered(&self, _event: &NSEvent) {
             trace_scope!("mouseEntered:");
+            if unsafe { self.window().inLiveResize() } {
+                return;
+            }
             self.queue_event(WindowEvent::CursorEntered {
                 device_id: DEVICE_ID,
             });
@@ -858,11 +861,9 @@ impl WinitView {
     fn surface_resized(&self) {
         let size = self.surface_size();
         let view = self.retain();
-        self.ivars().app_delegate.maybe_queue_window_resize(
-            self.window().id(),
-            size,
-            move || view.surface_size(),
-        );
+        self.ivars()
+            .app_delegate
+            .maybe_queue_window_resize(self.window().id(), size, move || view.surface_size());
     }
 
     /// Returns the drawable size from the view's backing-coordinate bounds.
@@ -1101,7 +1102,38 @@ impl WinitView {
         });
     }
 
+    /// Restores client cursor input after AppKit releases a native resize gesture.
+    ///
+    /// Samples the current pointer independently of the event stream, since the last NSEvent
+    /// can still contain the resize-start position. An outside pointer stays absent; an inside
+    /// pointer emits entry followed by its position in backing pixels, without requiring motion.
+    pub(super) fn restore_cursor_after_live_resize(&self) {
+        let window_point = unsafe { self.window().mouseLocationOutsideOfEventStream() };
+        let view_point = self.convertPoint_fromView(window_point, None);
+        let bounds = self.bounds();
+        if view_point.x < bounds.origin.x
+            || view_point.y < bounds.origin.y
+            || view_point.x >= bounds.origin.x + bounds.size.width
+            || view_point.y >= bounds.origin.y + bounds.size.height
+        {
+            return;
+        }
+
+        self.queue_event(WindowEvent::CursorEntered { device_id: DEVICE_ID });
+        self.queue_event(WindowEvent::CursorMoved {
+            device_id: DEVICE_ID,
+            position: LogicalPosition::new(view_point.x, view_point.y)
+                .to_physical(self.scale_factor()),
+        });
+    }
+
     fn mouse_motion(&self, event: &NSEvent) {
+        // Tracking rectangles are rebuilt during resize. Any incidental view events must not
+        // restore client hover while AppKit still owns the pointer gesture.
+        if unsafe { self.window().inLiveResize() } {
+            return;
+        }
+
         let window_point = unsafe { event.locationInWindow() };
         let view_point = self.convertPoint_fromView(window_point, None);
         let frame = self.frame();
