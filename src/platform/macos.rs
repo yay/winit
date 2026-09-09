@@ -93,6 +93,14 @@ use crate::window::{Window, WindowAttributes};
 
 /// Additional methods on [`Window`] that are specific to MacOS.
 pub trait WindowExtMacOS {
+    /// Marks this window as being dragged through application-issued position commands.
+    ///
+    /// While active, suppresses AppKit screen-boundary frame adjustments that can fight
+    /// those commands. This uses guarded private AppKit callbacks on supported macOS versions;
+    /// it does not capture input, move the window, or start the native window drag loop.
+    /// Call with `false` on release, cancellation, or before transferring drag ownership.
+    fn set_app_controlled_drag(&self, active: bool);
+
     /// Returns whether AppKit is currently live-resizing the window.
     ///
     /// This is `true` only while the user is interactively resizing the window or AppKit is
@@ -182,6 +190,11 @@ pub trait WindowExtMacOS {
 }
 
 impl WindowExtMacOS for Window {
+    #[inline]
+    fn set_app_controlled_drag(&self, active: bool) {
+        self.window.maybe_wait_on_main(move |w| w.set_app_controlled_drag(active));
+    }
+
     #[inline]
     fn is_live_resizing(&self) -> bool {
         self.window.maybe_wait_on_main(|w| w.is_live_resizing())

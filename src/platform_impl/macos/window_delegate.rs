@@ -13,7 +13,7 @@ use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClas
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAppKitVersionNumber10_12, NSAppearance, NSAppearanceCustomization,
     NSAppearanceNameAqua, NSApplication, NSApplicationPresentationOptions, NSBackingStoreType,
-    NSColor, NSDraggingDestination, NSFilenamesPboardType, NSPasteboard,
+    NSColor, NSDraggingDestination, NSEvent, NSFilenamesPboardType, NSPasteboard,
     NSRequestUserAttentionType, NSScreen, NSView, NSWindowButton, NSWindowDelegate,
     NSWindowFullScreenButton, NSWindowLevel, NSWindowOcclusionState, NSWindowOrderingMode,
     NSWindowSharingType, NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
@@ -195,12 +195,14 @@ declare_class!(
         #[method(windowDidMove:)]
         fn window_did_move(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidMove:");
+            self.trace_tab_drag("move_notification", None);
             self.emit_move_event();
         }
 
         #[method(windowDidChangeBackingProperties:)]
         fn window_did_change_backing_properties(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidChangeBackingProperties:");
+            self.trace_tab_drag("backing_notification", None);
             let scale_factor = self.scale_factor();
             if scale_factor == self.ivars().previous_scale_factor.get() {
                 return;
@@ -360,6 +362,7 @@ declare_class!(
         #[method(windowDidChangeOcclusionState:)]
         fn window_did_change_occlusion_state(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidChangeOcclusionState:");
+            self.trace_tab_drag("occlusion_notification", None);
             let visible = self.window().occlusionState().contains(NSWindowOcclusionState::Visible);
             self.queue_event(WindowEvent::Occluded(!visible));
         }
@@ -367,6 +370,7 @@ declare_class!(
         #[method(windowDidChangeScreen:)]
         fn window_did_change_screen(&self, _: Option<&AnyObject>) {
             trace_scope!("windowDidChangeScreen:");
+            self.trace_tab_drag("screen_notification", None);
             let is_simple_fullscreen = self.ivars().is_simple_fullscreen.get();
             if is_simple_fullscreen {
                 if let Some(screen) = self.window().screen() {
@@ -580,7 +584,7 @@ fn new_window(
 
         let window: Option<Retained<WinitWindow>> = unsafe {
             msg_send_id![
-                super(mtm.alloc().set_ivars(())),
+                super(mtm.alloc().set_ivars(super::window::WinitWindowState::default())),
                 initWithContentRect: frame,
                 styleMask: masks,
                 backing: NSBackingStoreType::NSBackingStoreBuffered,
@@ -832,7 +836,67 @@ impl WindowDelegate {
         self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
     }
 
+    /// Logs native geometry without mutating it, for an explicitly enabled diagnostic launch.
+    /// AppKit fields are in bottom-left screen points; backing bounds are physical pixels.
+    fn trace_tab_drag(&self, phase: &str, requested: Option<NSPoint>) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("STEADY_TRACE_TAB_DRAG").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+        let window = self.window();
+        let view = self.view();
+        let screen = window.screen();
+        let mtm = MainThreadMarker::from(self);
+        let screen_info = screen
+            .as_ref()
+            .map(|screen| (get_display_id(screen), screen.frame(), screen.backingScaleFactor()));
+        // Capture a few native call stacks if a left-crossing carrier is still snapped to x=0.
+        // This identifies asynchronous AppKit adjustments without a debugger or GUI automation.
+        if phase == "move_notification"
+            && window.frame().origin.x == 0.0
+            && unsafe { NSEvent::pressedMouseButtons() & 1 != 0 && !window.isMovable() }
+            && unsafe { NSEvent::mouseLocation().x < -50.0 }
+        {
+            static STACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if STACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                tracing::info!(
+                    target: "steady_drag_trace",
+                    phase = "unexpected_move_stack",
+                    window_id = ?window.id(),
+                    stack = ?unsafe { objc2_foundation::NSThread::callStackSymbols() },
+                );
+            }
+        }
+        let bounds = view.bounds();
+
+        let backing = unsafe { view.convertRectToBacking(bounds) };
+        tracing::info!(
+            target: "steady_drag_trace",
+            layer = "appkit",
+            phase,
+            window_id = ?window.id(),
+            native_number = unsafe { window.windowNumber() },
+            ?requested,
+            frame = ?window.frame(),
+            ?bounds,
+            ?backing,
+            scale = self.scale_factor(),
+            screen = ?screen_info,
+            pointer = ?unsafe { NSEvent::mouseLocation() },
+            buttons = unsafe { NSEvent::pressedMouseButtons() },
+            visible = window.isVisible(),
+            key = window.isKeyWindow(),
+            movable = unsafe { window.isMovable() },
+            app_controlled_drag = window.app_controlled_drag(),
+            active_space = unsafe { window.isOnActiveSpace() },
+            separate_spaces = unsafe { NSScreen::screensHaveSeparateSpaces(mtm) },
+        );
+    }
+
     fn handle_scale_factor_changed(&self, scale_factor: CGFloat) {
+        self.trace_tab_drag("deliver_scale", None);
         let app_delegate = &self.ivars().app_delegate;
         let window = self.window();
 
@@ -911,10 +975,12 @@ impl WindowDelegate {
     }
 
     pub fn set_visible(&self, visible: bool) {
+        self.trace_tab_drag(if visible { "before_show" } else { "before_hide" }, None);
         match visible {
             true => self.window().makeKeyAndOrderFront(None),
             false => self.window().orderOut(None),
         }
+        self.trace_tab_drag("after_visible", None);
     }
 
     #[inline]
@@ -973,7 +1039,16 @@ impl WindowDelegate {
             NSPoint::new(position.x, position.y),
             self.window().frame().size,
         ));
-        unsafe { self.window().setFrameOrigin(point) };
+        self.trace_tab_drag("before_move", Some(point));
+        if self.window().app_controlled_drag() {
+            // Set the full native frame during manual dragging, as Chromium's move loop does.
+            // Preserve the current size; only the origin belongs to this movement command.
+            let frame = NSRect::new(point, self.window().frame().size);
+            unsafe { self.window().setFrame_display_animate(frame, false, false) };
+        } else {
+            unsafe { self.window().setFrameOrigin(point) };
+        }
+        self.trace_tab_drag("after_move", Some(point));
     }
 
     #[inline]
@@ -990,6 +1065,7 @@ impl WindowDelegate {
 
     #[inline]
     pub fn request_inner_size(&self, size: Size) -> Option<PhysicalSize<u32>> {
+        self.trace_tab_drag("before_resize", None);
         let scale_factor = self.scale_factor();
         let size = size.to_logical(scale_factor);
         self.window().setContentSize(NSSize::new(size.width, size.height));
@@ -1774,6 +1850,10 @@ fn restore_and_release_display(monitor: &MonitorHandle) {
 }
 
 impl WindowExtMacOS for WindowDelegate {
+    fn set_app_controlled_drag(&self, active: bool) {
+        self.window().set_app_controlled_drag(active);
+    }
+
     #[inline]
     fn is_live_resizing(&self) -> bool {
         WindowDelegate::is_live_resizing(self)
